@@ -1,0 +1,609 @@
+---
+title: "Flow motifs"
+output:
+  html_notebook:
+    code_folding: hide
+---
+
+* For now xG is simply shots fired from a tile with some possibility of being converted. Motif will be weighted by this ratio.
+* Should set pieces be considered? Currently they are, but could be limited to possession and counter attacks
+* A xG motif should:
+    + consist of at least one pass ending in a xG with some probability of succeeding
+    + be weighted by its probability of scoring
+* A possession motif should:
+    + be a passing sequence of at least three passes that are not part of a xG motif
+* At most three passes per motif are considered, meaning an xG motif will be at least one but no more than three passes long, but a possession motif will always be three passes long. 
+
+```{r message=FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(purrr)
+library(here)
+source(here("pitch-polygons.R"))  # draws field lines, boxes etc.
+source(here("theme-pitch.R")) # ggplot pitch theme
+pitch_polys <- pitch_polygons()
+```
+
+# Data
+
+List all actions:
+
+```{r}
+# Get events data and id tables
+df <- readRDS(here("data", "events.rds"))
+fixtures <- readRDS(here("data", "fixtures.rds"))
+id_action <- readRDS(here("data", "id_action.rds"))
+id_team <- readRDS(here("data", "id_team.rds"))
+id_standart <- readRDS(here("data", "id_standart.rds"))
+id_body <- readRDS(here("data", "id_body.rds"))
+id_player <- readRDS(here("data", "id_player.rds"))
+
+df %>%
+  inner_join(id_action, by = "action_id") %>%
+  distinct(action_id, action_name) %>%
+  arrange(action_id)
+```
+
+Defining events that can be dropped and events that identifies accurate passes
+
+```{r}
+# Id's that when they occur do not necessarily break the passing flow.
+drop_ids <- c(2010, 2020, 2030, 2051, 3080, 10000, 21000, 22000)
+
+# All accurate passes
+pass_ids <- c(1011, 1021, 1031, 1040, 1050, 1061, 1070)
+```
+
+Events are grouped into sequences. A sequence stops and a new sequence starts if:
+
+1. the event is not an accurate pass
+2. the event is not in open play, e.g. throw ins or free kicks
+3. the current `player_id` is not equal to the previous `opponent_id`
+4. it has passed more than five seconds since the preceding event
+
+```{r}
+# Add sequences
+all_seq <- df %>%
+  # Order by incurred event
+  arrange(match_id, half, second, id) %>%
+  # Drop unnecessary events
+  filter(!(action_id %in% drop_ids)) %>%
+  # Must be data error
+  filter(
+    !(!is.na(player_id) & !is.na(opponent_id) & player_id == opponent_id)
+  ) %>%
+  # For how long has the current player had the ball?
+  mutate(dt = second  - lag(second)) %>%
+  # Increment if:
+  # It's not an accurate pass
+  # The event is not in open play
+  # Current player was not the opponent player in the preceding event
+  # The player has had the ball for more than 5 seconds
+  # player_id and opponent_id are identical
+  mutate(
+    lag_oppo = lag(opponent_id),
+    acc_pass = !(action_id %in% pass_ids),
+    opn_play = (standart_id != 1),
+    prv_play = ifelse(is.na(lag_oppo) | is.na(player_id),
+                      TRUE, 
+                      player_id != lag_oppo),
+    pos_time = ifelse(!is.na(dt) & dt > 5, TRUE, FALSE),
+    n_seq = cumsum(pmin(acc_pass + opn_play + prv_play + pos_time, 1))
+  ) %>%
+  select(acc_pass, opn_play, prv_play, pos_time, n_seq, everything())
+```
+
+Passing sequences contain accurate passes excluding set pieces, but including passes in a set piece attack. The first pass in each sequence has `dt` equal to zero as this marks the start of the sequence
+
+```{r}
+pass_seq <- all_seq %>%
+  # Open play accurate passes
+  filter(action_id %in% pass_ids & standart_id == 1) %>%
+  group_by(n_seq) %>%
+  # The first event isn't counted as dt can be large if preceding event was
+  # a foul or a ball out of field
+  mutate(dt = ifelse(row_number() == 1, NA, dt)) %>% 
+  ungroup() %>%
+  select(n_seq, dt, acc_pass, opn_play, prv_play, pos_time, n_seq, everything())
+```
+
+Plots of number of passes within a seqence and the time each player has possession of the ball.
+
+```{r fig.width=9.5, fig.height=4}
+p1 <- pass_seq %>%
+  count(n_seq) %>%
+  ggplot(aes(x = n)) + geom_bar() + geom_rug() +
+  labs(
+    x = "Nbr of passes in sequence",
+    y = "Nbr of sequences",
+    title = "Passing Sequences",
+    subtitle = "Most sequences have only one pass"
+  )
+
+p2 <- pass_seq %>%
+  filter(!is.na(dt)) %>%
+  ggplot(aes(x = dt)) + geom_histogram(bins = 40) +
+  labs(
+    x = "Time between events",
+    y = "Nbr of cases",
+    title = "Time between passes",
+    subtitle = "More than five seconds is considered a new sequence"
+  )
+
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+
+The pitch is divided into a grid of 24 x 16 tiles. For each tile, number of goals divided by number of shots is computed. This is taken as the expected goals probability. There has to be at least 10 shots taken from a tile for it to be counted.
+
+```{r}
+shots <- all_seq %>%
+  # All types of shots and goals
+  filter(action_id %in% c(4010, 4020, 4030, 4040, 4050, 8010)) %>%
+  mutate(
+    goal = (action_id == 8010),
+    # Create tiles
+    dx = 105 / 24,
+    dy = 68 / 16,
+    xmin = floor(pos_x / dx) * dx,
+    xmax = ceiling(pos_x / dx) * dx,
+    ymin = floor(pos_y / dy) * dy,
+    ymax = ceiling(pos_y / dy) * dy
+  ) %>%
+  group_by(xmin, xmax, ymin, ymax) %>%
+  # Percent of successful shots
+  mutate(pct = mean(goal), n = n()) %>%
+  ungroup() %>%
+  select(n_seq, xmin, xmax, ymin, ymax, pct, n, player_id)
+  
+shots %>%
+  # At least 10 shots requirement
+  filter(n > 10) %>%
+  mutate_at(.vars = c("xmin", "xmax", "ymin", "ymax"), funs(. * 100)) %>%
+  distinct(xmin, xmax, ymin, ymax, pct) %>%
+  ggplot() +
+  geom_polygon(
+    data = pitch_polys,
+    aes(x = x, y = y, group = id),
+    alpha = 0,
+    colour = "#EBF4EB"
+  ) +
+  theme_pitch() +
+  geom_rect(
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = pct)
+  ) + labs(
+    title = "Shots converted from different positions on the pitch",
+    subtitle = "The pitch divided into 24 x 16 tiles. If less than 10 shots have been taken then xG is set to zero"
+  )
+```
+
+If a sequence ends in a shot it is counted as a xG motif. These are identified by matching the last pass played in each sequence with the player taking the succeeding shot. The xG percentage calculated for each tile will be used as a weight for xG motifs, i.e. sequences ending in shots taken from high xG tiles are weighted higher. 
+
+```{r}
+# Last pass in sequence should go to player taking a shot to be xG motif
+last_pass <- pass_seq %>%
+  group_by(n_seq) %>%
+  filter(row_number() == n()) %>%
+  select(n_seq, opponent_id)
+
+gs_opp <- shots %>%
+  # Decrease n_seq to match preceding passing sequence
+  mutate(n_seq = n_seq - 1) %>%
+  inner_join(last_pass, by = c("n_seq" = "n_seq", "player_id" = "opponent_id"))
+
+pass_seq <- pass_seq %>%
+  left_join(gs_opp[, c("n_seq", "pct", "n")], by = "n_seq") %>%
+  rename(weight = pct, n_shots = n)
+
+rm(last_pass, gs_opp)
+```
+
+Split into xG and Possession motifs
+
+```{r}
+# Sequences ending in shot
+seq_shot <- pass_seq %>%
+  # Sequences ending in a finish
+  filter(!is.na(weight)) %>%
+  # Last pass before the shot comes first 
+  arrange(n_seq, desc(second)) %>%
+  group_by(n_seq) %>%
+  # If more than 3 passes from shot it's not part of xG motif
+  mutate(xG = ifelse(row_number() < 4, 1L, 0L))
+
+# xG motifs
+xg_motif <- seq_shot %>% filter(xG == 1)
+
+# Possession motifs
+pos_motif <- seq_shot %>%
+  # More than 3 passes from finish
+  filter(xG == 0) %>%
+  # Sequences not ending in shot
+  bind_rows(filter(pass_seq, is.na(weight))) %>%
+  mutate(weight = NA, n_shots = NA, xG = 0L) %>%
+  group_by(n_seq) %>%
+  # At least 3 passes in a sequence to be considered
+  filter(n() > 2) %>%
+  ungroup() %>%
+  arrange(n_seq, second)
+
+# Stack in one dataset
+motifs <- xg_motif %>% bind_rows(pos_motif)
+
+# Clean up
+rm(seq_shot, xg_motif, pos_motif)
+```
+
+Adding last `opponent_id` as its own row
+
+```{r}
+motifs <- motifs %>%
+  arrange(xG, n_seq, second) %>%
+  group_by(xG, n_seq) %>%
+  mutate(k = row_number()) %>%
+  bind_rows(
+    filter(., row_number() == n()) %>%
+      mutate(k = k + 1,
+             player_id = opponent_id,
+             position_id = opponent_position_id) %>%
+      mutate(across(c("dt", "action_id", "second", "opponent_id"), ~ NA))
+  ) %>%
+  ungroup() %>%
+  arrange(xG, n_seq, k) %>%
+  select(
+    match_id,
+    n_seq,
+    dt,
+    action_id,
+    half,
+    second,
+    team_id,
+    player_id,
+    position_id,
+    opponent_id,
+    opponent_position_id,
+    attack_type_id,
+    weight,
+    n_shots,
+    xG,
+    k
+  )
+```
+
+Possession motifs with more than 3 + n passes are split into n + 1 sequences
+
+```{r}
+pos_motif <- motifs %>%
+  filter(xG == 0) %>%
+  # By original n_seq
+  group_by(n_seq) %>%
+  nest() %>%
+  mutate(data_long = map(data, function(d) {
+    # Nbr of sub sequences
+    n <- nrow(d) - 3
+    # Melt, e.g. 1:5 -> 1:4, 2:5
+    d[c(sapply(1:n, function(x) x:(x + 3))), ]
+  })) %>%
+  # Drop original data
+  select(-data) %>%
+  # New long dataset
+  unnest(data_long) %>%
+  # Group by original n_seq to mark sub sequences
+  group_by(n_seq) %>%
+  # Mark first row of each sequence and new sub sequence
+  mutate(flag = (k == 1) | (k < lag(k))) %>%
+  ungroup() %>%
+  mutate(id = cumsum(flag)) %>%
+  group_by(id) %>%
+  mutate(k = row_number()) %>%
+  ungroup() %>%
+  select(-flag) %>%
+  select(n_seq, id, k, everything())
+
+xg_motif <- motifs %>%
+  filter(xG == 1) %>%
+  group_by(n_seq) %>%
+  mutate(flag = (row_number() == 1)) %>%
+  ungroup() %>%
+  mutate(id = cumsum(flag)) %>%
+  select(-flag) %>%
+  select(n_seq, id, k, everything())
+
+rm(motifs)
+```
+
+# Player Motifs
+
+A player motif is a sequence of passes, e.g. ABCD which involves three different players. When calculating motifs for a specific player, that player is always referred to as A. Another motif could be BAC, i.e. player B (can be any player) passes the ball to A (always the same player) who in turn passes the ball to C (which again can be any other player than B).
+
+```{r eval=FALSE}
+# This operation only has to be performed once
+pos_motif_nested <- pos_motif %>%
+  select(match_id, id, k, player_id, team_id, weight) %>%
+  # All possession motifs weighted equally
+  mutate(weight = 1L) %>%
+  group_by(id) %>%
+  nest() %>%
+  mutate(player_ids = map(data, ~ unique(.$player_id)))
+
+xg_motif_nested <- xg_motif %>%
+  # Require at least 10 shots from tile for it to be counted
+  mutate(weight = ifelse(n_shots > 10, weight, 0)) %>%
+  select(match_id, id, k, player_id, team_id, weight) %>%
+  group_by(id) %>%
+  nest() %>%
+  mutate(player_ids = map(data, ~ unique(.$player_id)))
+
+# Function that sets ABC etc
+set_player_letter <- function(id_A, df = pos_motif_nested) {
+  tmp_str <- c("id", "team_id", "weight", "match_id")
+  df %>%
+  # Keep only sequences where player id id_A is involved
+  mutate(keep_seq = as.logical(map(player_ids, ~ id_A %in% .))) %>%
+  filter(keep_seq) %>%
+  select(-keep_seq, -player_ids) %>%
+  # For each sequence
+  mutate(
+    data = map(data, function(df) {
+        # unique player_id with id_A first
+        ids <- c(id_A, unique(setdiff(df$player_id, id_A)))
+        # Get index for each letter in sequence
+        idx <- map2_dfr(ids, LETTERS[1:length(ids)], function(x, y) {
+          tibble(ind = which(df$player_id == x), letter = y)
+      })
+      # Set correct letter
+      df[idx$ind, "letter"] <- idx$letter
+      df
+    })
+  ) %>%
+  unnest(data) %>%
+  select(-player_id) %>%
+  # Transpose from long to wide
+  spread(k, letter) %>%
+  # Replace NA with ""
+  mutate_at(.vars = setdiff(names(.), tmp_str),
+            funs(ifelse(is.na(.), "", .))) %>%
+  # Unite letters into one columns
+  unite(motif, setdiff(names(.), tmp_str), sep = "") %>%
+  # Keys: team_id and player_id
+  mutate(player_id = id_A) %>%
+  # Aggregate
+  group_by(match_id, team_id, player_id, motif) %>%
+  summarise(n = n(), n_weighted = sum(weight), .groups = "drop")
+}
+
+# player_id to be set as A
+all_ids <- unique(pos_motif$player_id)
+pos_motif_player <- all_ids %>% map_dfr(set_player_letter)
+
+all_ids <- unique(xg_motif$player_id)
+xg_motif_player <-  all_ids %>% map_dfr(set_player_letter, xg_motif_nested)
+
+# Clean up
+rm(pos_motif_nested, xg_motif_nested, all_ids)
+```
+
+```{r include=FALSE, eval=FALSE}
+saveRDS(pos_motif_player, file = "pos_motif_player.rds")
+saveRDS(xg_motif_player, file = "xg_motif_player.rds")
+```
+
+```{r include=FALSE}
+pos_motif_player <- readRDS(here("data", "pos-motif-player.rds"))
+xg_motif_player <- readRDS(here("data", "xg-motif-player.rds"))
+```
+
+Calculating player motifs for all players in the data
+
+```{r}
+xg_player_levels <- c(
+  "ABG", "ABCAG", "BACAG", "BABAG", "ABAG", "BCDAG", "BCBAG", "BCAG", "BAG",
+  "ABCDG", "ABCBG", "BACDG", "BACBG", "BABCG", "ABCG", "ABACG", "ABABG",
+  "BCADG", "BCACG", "BCABG", "BACG", "BABG"
+)
+
+pos_player_levels <- c(
+  "ABCA", "BACA", "BABA", "BCDA", "BCBA", "ABCD", "ABCB", "BACD", "BACB",
+  "BABC", "ABAC", "ABAB", "BCAD", "BCAC", "BCAB"
+)
+
+xg_motif_player <- xg_motif_player %>%
+  ungroup() %>%
+  expand(nesting(team_id, player_id, match_id), motif) %>%
+  left_join(ungroup(xg_motif_player),
+            by = c("team_id", "player_id", "match_id", "motif")) %>%
+  mutate_at(vars(n, n_weighted), funs(ifelse(is.na(.), 0, .))) %>%
+  mutate(
+    motif = paste0(motif, "G"),
+    motif = factor(motif, levels = xg_player_levels)
+  ) %>%
+  group_by(team_id, player_id, motif) %>%
+  summarise(score = sum(n_weighted), .groups = "drop")
+
+pos_motif_player <- pos_motif_player %>%
+  ungroup() %>%
+  expand(nesting(team_id, player_id, match_id), motif) %>%
+  left_join(ungroup(pos_motif_player),
+            by = c("team_id", "player_id", "match_id", "motif")) %>%
+  mutate_at(vars(n, n_weighted), funs(ifelse(is.na(.), 0, .))) %>%
+  mutate(motif = factor(motif, levels = pos_player_levels)) %>%
+  group_by(team_id, player_id, motif) %>%
+  summarise(score = sum(n_weighted), .groups = "drop")
+```
+
+Scores are normalized by the number of played 90s
+
+```{r}
+halfs <- readRDS(here("data", "info_match_times.rds"))
+subs <- readRDS(here("data", "info_substitutions.rds"))
+
+halfs <- halfs %>%
+  filter(action_id %in% c(18030, 18040)) %>%
+  select(match_id, action_id, second) %>%
+  spread(action_id, second) %>%
+  mutate(match_end = `18030` + `18040`, half_time = `18030`) %>%
+  select(match_id, half_time, match_end)
+
+subs <- subs %>%
+  select(match_id, player_id, opponent_id, team_id, half, second) %>%
+  rename(sub_in = opponent_id, sub_out = player_id) %>%
+  gather(sub_type, player_id, -match_id, -team_id, -half, -second) %>%
+  inner_join(halfs, by = "match_id") %>%
+  mutate(second = ifelse(half == 2, second + half_time, second)) %>%
+  select(match_id, team_id, player_id, sub_type, second) %>%
+  spread(sub_type, second)
+
+played_90s <- df %>%
+  filter(!is.na(player_id)) %>%
+  distinct(match_id, player_id, team_id) %>%
+  left_join(subs, by = c("match_id", "team_id", "player_id")) %>%
+  left_join(halfs, by = "match_id") %>% 
+  mutate(
+    start = ifelse(is.na(sub_in), 0, sub_in),
+    end = ifelse(is.na(sub_out), match_end, sub_out),
+    n90s = (end - start) / (90 * 60)
+  ) %>% 
+  group_by(team_id, player_id) %>%
+  summarise(n90s = sum(n90s), .groups = "drop")
+
+id_player <- readRDS(here("data", "id_player.rds"))
+
+coord_radar <- function (theta = "x", start = 0, direction = 1) {
+  theta <- match.arg(theta, c("x", "y"))
+  r <- if (theta == "x") "y" else "x"
+  ggproto(
+    "CordRadar",
+    CoordPolar,
+    theta = theta,
+    r = r,
+    start = start, 
+    direction = sign(direction),
+    is_linear = function(coord) TRUE
+  )
+}
+```
+
+## xG
+
+```{r fig.width=16}
+xg_motifs_90s <- xg_motif_player %>%
+  inner_join(filter(played_90s, n90s > 10),
+             by = c("team_id", "player_id")) %>%
+  mutate(score_w = score / n90s) %>%
+  group_by(motif) %>%
+  mutate(score_ws = scales::rescale(score_w)) %>%
+  ungroup()
+
+top6 <- xg_motifs_90s %>%
+  group_by(team_id, player_id) %>%
+  summarise(score = sum(score), n90s = sum(n90s), .groups = "drop") %>%
+  mutate(score_w = score / n90s) %>%
+  arrange(desc(score_w)) %>%
+  filter(row_number() < 7) %>%
+  pull(player_id)
+
+xg_motifs_90s %>%
+  filter(player_id %in% top6) %>%
+  inner_join(id_player, by = "player_id") %>%
+  ggplot(aes(motif, score_ws, group = player_id)) +
+  geom_polygon(fill = NA, colour = "black") +
+  facet_wrap(. ~ player_name) +
+  coord_radar() +
+  scale_x_discrete(drop = F) +
+  ylim(0, 1) +
+  theme_minimal() +
+  labs(
+    y = "",
+    x = "",
+    title = "PxGMs Allsvenskan 2017 & 2018",
+    subtitle = "Jeremejeff and Rosenberg create xG for the team in the build up play. Sebastian Andersson and Carlos Strandberg tend not to create a lot of xG in attacks where they are not the finishing player."
+  )
+```
+
+```{r fig.width=12}
+plt1 <- xg_motifs_90s %>%
+  group_by(team_id, player_id) %>%
+  mutate(motif_prob = score / sum(score)) %>%
+  ungroup() %>%
+  mutate(x = as.character(motif)) %>%
+  filter(substr(x, nchar(x) - 3, nchar(x)) %in% c("ABAG", "ACAG"))
+
+plt2 <- plt1 %>%
+  filter((score_w > 0.02) | (motif_prob > 0.1)) %>%
+  inner_join(id_player, by = "player_id")
+
+ggplot(plt1, aes(x = score_w, y = motif_prob)) +
+  geom_point(na.rm = TRUE) +
+  ggrepel::geom_text_repel(data = plt2, aes(label = player_name)) +
+  labs(
+    y = "XAXAG probability",
+    x = "XAXAG intensity",
+    title = "PxGM for XAXAG motifs (X can be any or no player)",
+    subtitle = "Players on the right uses this motif more times per game than other players to create xG. Players in the top use this motif with a higher probability compared to other \nmotifs (this tends to be CBs for some reason)."
+  )
+```
+
+
+## Possession
+
+```{r fig.width=16}
+pos_motifs_90s <- pos_motif_player %>%
+  inner_join(filter(played_90s, n90s > 10),
+             by = c("team_id", "player_id")) %>%
+  mutate(score_w = score / n90s) %>%
+  group_by(motif) %>%
+  mutate(score_ws = scales::rescale(score_w)) %>%
+  ungroup()
+
+top6 <- pos_motifs_90s %>%
+  group_by(team_id, player_id) %>%
+  summarise(score = sum(score), n90s = sum(n90s), .groups = "drop") %>%
+  mutate(score_w = score / n90s) %>%
+  arrange(desc(score_w)) %>%
+  filter(row_number() < 7) %>%
+  pull(player_id)
+
+pos_motifs_90s %>%
+  filter(player_id %in% top6) %>%
+  inner_join(id_player, by = "player_id") %>%
+  ggplot(aes(motif, score_ws, group = player_id)) +
+  geom_polygon(fill = NA, colour = "black") +
+  facet_wrap(. ~ player_name) +
+  coord_radar() +
+  scale_x_discrete(drop = F) +
+  ylim(0, 1) +
+  theme_minimal() +
+  labs(
+    y = "",
+    x = "",
+    title = "PPM motifs",
+    subtitle = "Apparently, Spanish players love passing the ball..."
+  )
+```
+
+
+
+```{r fig.width=12}
+plt1 <- pos_motifs_90s %>%
+  group_by(team_id, player_id) %>%
+  mutate(motif_prob = score / sum(score)) %>%
+  ungroup() %>%
+  filter(motif == "ABCD")
+
+plt2 <- plt1 %>%
+  filter((score_w > 14) | (motif_prob < 0.05) | (motif_prob > 0.22)) %>%
+  inner_join(id_player, by = "player_id")
+
+ggplot(plt1, aes(x = score_w, y = motif_prob)) +
+  geom_point() +
+  ggrepel::geom_text_repel(data = plt2, aes(label = player_name)) +
+  labs(
+    x = "ABCD intensity",
+    y = "ABCD probability",
+    title = "PPM ABCD scatter plot",
+    subtitle = "GKs are expected to make the first pass with a high probability. Out on the right, after winning the ball, defenders tend to start this motif most frequently."
+  )
+```
+
+
+
